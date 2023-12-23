@@ -4,14 +4,83 @@ import os
 from nio import (
     AsyncClient, AsyncClientConfig, LoginResponse, MatrixRoom, RoomMessageText, ToDeviceMessage,
     KeyVerificationEvent, KeyVerificationStart, KeyVerificationCancel, KeyVerificationKey,
-    KeyVerificationMac, ToDeviceError, LocalProtocolError, exceptions
+    KeyVerificationMac, ToDeviceError, LocalProtocolError, exceptions, ProfileGetDisplayNameResponse
 )
 import mystic_bbs as bbs
 import asyncio
+import sqlite3
+import random
 
 address = "https://matrix.org"
 token_file  = "/mystic/src/data/zealmatrix/access_token.json"
+db_file = "/mystic/src/data/zealmatrix/users.sqlite"
 
+# Database setup
+def setup_database():
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            color INTEGER,
+            host TEXT,
+            username TEXT,
+            display_name TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_existing_user_ids():
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users')
+    user_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return user_ids
+
+async def save_users(client, room_id):
+    room = client.rooms[room_id]
+    user_ids = room.users
+    existing_user_ids = get_existing_user_ids()
+
+    new_user_ids = [uid for uid in user_ids if uid not in existing_user_ids]
+    display_names = await asyncio.gather(*(client.get_displayname(uid) for uid in new_user_ids))
+
+    for user_id, response in zip(new_user_ids, display_names):
+        if isinstance(response, ProfileGetDisplayNameResponse) and response.displayname:
+            display_name_str = response.displayname
+        else:
+            display_name_str = ""
+        await save_user(client, user_id, display_name_str)  # Adjust this function to be a coroutine
+
+async def save_user(client, user_id, display_name_str):
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+
+
+    # Check if the user already exists
+    cursor.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+    if cursor.fetchone() is None:
+        # User does not exist, insert new user
+        color = random.randint(1, 15)
+        host = user_id.split(':')[-1]
+        username = user_id.split(':')[0][1:]
+        cursor.execute('''
+            INSERT INTO users (user_id, color, host, username, display_name)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, color, host, username, display_name_str))
+        conn.commit()
+
+    conn.close()
+
+def get_user_info(user_id):
+    conn = sqlite3.connect(db_file)
+    cursor = conn.cursor()
+    cursor.execute('SELECT color, host, username, display_name FROM users WHERE user_id = ?', (user_id,))
+    user_info = cursor.fetchone()
+    conn.close()
+    return user_info
 
 # Functions for token handling
 async def save_token(user_id, device_id, access_token):
@@ -113,20 +182,48 @@ def trust_devices(client: AsyncClient, user_id: str, device_list: Optional[list]
         client.verify_device(olm_device)
         bbs.writeln(f"Trusting {device_id} from user {user_id}")
 
+async def check_password(client, username, password):
+    temp_client = AsyncClient(address, username)
+    response = await temp_client.login(password)
+    await temp_client.close()  # Close the temporary client
+    return isinstance(response, LoginResponse)
+    
+def parse_event(event, show_remote, show_names):
+    user_info = get_user_info(event.sender)
+    if user_info:
+        color, host, username, display_name = user_info
+        name = display_name if (show_names and display_name) else username
+
+        if show_remote:
+            message = f"|{color:02d}{name}|08: {host}:|15 {event.body}"
+        else:
+            message = f"|{color:02d}{name}|08:|15 {event.body}"
+    else:
+        # Fallback if user info not found
+        message = f"|08{event.sender}:|15 {event.body}"
+
+    bbs.writeln(message)
+
 async def main():
+    bbs.write("|CL")
     current_room_id = None
+    show_remote = False
+    show_names = True
     # Initialize MysticBBS
-    bbs.writeln("|08Enter your Matrix username:|02")
+    bbs.writeln("|02Enter your Matrix username:|08")
     username = bbs.getstr(1, 50, 120, "@username:matrix.org")
-    bbs.writeln("|08Enter your Matrix password:|02")
+    bbs.writeln("|02Enter your Matrix password:|08")
     password = bbs.getstr(6, 50, 120, "")
 
     client = setup_client(username)
-    token_data = await load_token()
 
+    token_data = await load_token()
     if token_data and token_data['user_id'] == username:
-        client = await restore_login(client, token_data)
-        bbs.writeln(f"Restored login for {token_data['user_id']}")
+        if await check_password(client, username, password):
+            client = await restore_login(client, token_data)
+            bbs.writeln(f"Restored login for {token_data['user_id']}")
+        else:
+            bbs.writeln("Incorrect password.")
     else:
         client = await login_and_sync(client, username, password)
         if client is None:
@@ -147,7 +244,14 @@ async def main():
     bbs.writeln("Starting main loop...")  # Debugging print
     while True:
         await client.sync()  # Perform the first sync
-        bbs.writeln("|08[|11L|08]ist rooms, |08[|11J|08]oin room, |08[|11S|08]end message, |08[|11U|08]ser list, |08[|11Q|08]uit")
+        bbs.write('|CL')
+        bbs.writeln("|[X00|[Y00|$C08|08[|11L|08]ist rooms, |08[|11J|08]oin room, |08[|11S|08]end message, |08[|11U|08]ser list, |08[|11Q|08]uit")
+        if current_room_id:
+            messages = await client.room_messages(current_room_id, "", limit=23)
+            for event in reversed(messages.chunk):
+                if isinstance(event, RoomMessageText):
+                    parse_event(event, show_remote, show_names)
+
         key, extended = bbs.getkey()
 
         if key.upper() == 'L':
@@ -160,11 +264,11 @@ async def main():
             # Creating a list of room IDs to easily access them by index
             room_ids = list(client.rooms.keys())
 
-            bbs.writeln(f"Room length:{len(room_ids)}") 
+            bbs.writeln(f"{len(room_ids)} rooms") 
 
             for i, room_id in enumerate(room_ids):
                 room_name = client.rooms[room_id].display_name or room_id
-                bbs.writeln(f"{i+1}. {room_name} ({room_id})")
+                bbs.writeln(f"|07[|11{i+1}|07]. {room_name}|08 ({room_id})|15")
 
             room_number = bbs.getstr(1, 2, 2, "Enter room number: ")
             if room_number.isdigit():
@@ -172,41 +276,53 @@ async def main():
                 if room_number >= 0 and room_number < len(room_ids):
                     selected_room_id = room_ids[room_number]
                     current_room_id = selected_room_id  # Update current room ID
+                    
                     await client.sync()  # Sync before listing rooms
+
+                    room = client.rooms[current_room_id]
+                    await save_users(client, current_room_id)
+
+                    for user_id in room.users:
+                        bbs.writeln(user_id)
+
                     await join_room(client, selected_room_id)
         
-
         elif key.upper() == 'S':
             if current_room_id:
-                message = bbs.getstr(11, 60, 120, "Enter a message to send: ")
+                message = bbs.getstr(11, 79, 1024, "")
                 await client.room_send(
                     room_id=current_room_id,
                     message_type="m.room.message",
                     content={"msgtype": "m.text", "body": message})
             else:
-                message = bbs.getstr(11, 60, 120, "Enter a message to send: ")
-                await client.room_send(
-                    room_id="!vlbfknVsxSzozrjWPu:neo.morale.ch",
-                    message_type="m.room.message",
-                    content={"msgtype": "m.text", "body": message})
+                bbs.writeln("You're not in any room...") 
 
-        elif key.upper() == 'U':  # New command for showing user list
-            bbs.writeln("Loading user list...") 
+        elif key.upper() == 'U':
+            bbs.writeln("Loading user list...")
             if current_room_id:
                 room = client.rooms[current_room_id]
+                await save_users(client, current_room_id)
                 for user_id in room.users:
                     bbs.writeln(user_id)
             else:
                 bbs.writeln("No room selected.")
     
-        # elif key.upper() == 'P':  # New command for viewing previous messages
-        #     if current_room_id:
-        #         messages = await client.room_messages(current_room_id, "", limit=10)
-        #         for event in messages.chunk:
-        #             if isinstance(event, RoomMessageText):
-        #                 bbs.writeln(f"{event.sender}: {event.body}")
-        #     else:
-        #         bbs.writeln("No room selected.")
+        elif key.upper() == 'P':  # New command for viewing previous messages
+            if current_room_id:
+                messages = await client.room_messages(current_room_id, "", limit=23)
+                for event in reversed(messages.chunk):
+                    if isinstance(event, RoomMessageText):
+                        parse_event(event, show_remote, show_names)
+
+            else:
+                bbs.writeln("No room selected.")
+    
+        elif key.upper() == 'I':
+            show_remote = not show_remote
+
+        elif key.upper() == 'N':
+            show_names = not show_names
+
         elif key.upper() == 'Q':
             return
 
@@ -218,14 +334,17 @@ async def main():
 if __name__ == "__main__":
     bbs.writeln("Starting script...")  # Debugging print
     try:
+        bbs.writeln("Init DB...")  # Debugging print
+        setup_database()
+    except Exception as e:
+        bbs.writeln(f"An error occurred: {e}")
+    try:
         asyncio.run(main())
     except KeyboardInterrupt:
         bbs.writeln("Script interrupted by user")
     except Exception as e:
         bbs.writeln(f"An error occurred: {e}")
 
-
-        
 class EmojiVerificationCallbacks:
     def __init__(self, client):
         self.client = client
