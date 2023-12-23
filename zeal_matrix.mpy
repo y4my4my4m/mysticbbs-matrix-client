@@ -1,36 +1,19 @@
 from typing import Optional
 import json
 import os
-from nio import ( 
-    AsyncClient,
-    AsyncClientConfig,
-    LoginResponse,
-    InviteEvent,
-    MatrixRoom,
-    RoomMessageText,
-    DeviceList,
-    DeviceOneTimeKeyCount,   
-    KeyVerificationCancel,
-    KeyVerificationEvent,
-    KeyVerificationKey,
-    KeyVerificationMac,
-    KeyVerificationStart,
-    LocalProtocolError,
-    LoginResponse,
-    ToDeviceMessage,
-    ToDeviceError,
-    JoinError,
-    crypto,
-    exceptions,
+from nio import (
+    AsyncClient, AsyncClientConfig, LoginResponse, MatrixRoom, RoomMessageText, ToDeviceMessage,
+    KeyVerificationEvent, KeyVerificationStart, KeyVerificationCancel, KeyVerificationKey,
+    KeyVerificationMac, ToDeviceError, LocalProtocolError, exceptions
 )
-
-# Check if E2EE related modules can be imported
-from nio.crypto import OlmDevice
-import mystic_bbs as bbs  # Importing MysticBBS Python API
+import mystic_bbs as bbs
 import asyncio
+
 address = "https://matrix.org"
 token_file  = "/mystic/src/data/zealmatrix/access_token.json"
 
+
+# Functions for token handling
 async def save_token(user_id, device_id, access_token):
     with open(token_file, "w") as f:
         json.dump({"user_id": user_id, "device_id": device_id, "access_token": access_token}, f)
@@ -41,44 +24,77 @@ async def load_token():
             return json.load(f)
     return None
 
+# Callbacks and helper functions
 async def message_callback(room, event):
-    try:
-        bbs.writeln(f"|11Message received in room {room.room_id}: {event.body}|15")
-    except exceptions.OlmUnverifiedDeviceError as e:
-        bbs.writeln(f"|145Warning: Unverified device encountered: {e}|15")
-    except exceptions.OlmBlacklistedDeviceError as e:
-        bbs.writeln(f"|04Warning: Blacklisted device encountered: {e}|15")
+    if isinstance(event, RoomMessageText):
+        try:
+            bbs.writeln(f"|11Message received in room {room.room_id}: {event.body}|15")
+        except Exception as e:
+            bbs.writeln(f"|145Error: {type(e).__name__}: {str(e)}|15")
+
+async def sync_client(client):
+    while True:
+        await client.sync(timeout=10000)
+        await asyncio.sleep(1)
+
+def setup_client(username):
+    client_config = AsyncClientConfig(
+        max_limit_exceeded=0,
+        max_timeouts=0,
+        encryption_enabled=True,
+        store_sync_tokens=True
+    )
+    return AsyncClient(address, username, store_path="/mystic/src/data/zealmatrix", config=client_config)
+
+async def login_and_sync(client, username, password):
+    response = await client.login(password, device_name="ZealBBS")
+    if isinstance(response, LoginResponse):
+        bbs.writeln(f"Logged in as {response.user_id}")
+        await save_token(response.user_id, client.device_id, response.access_token)
+        await client.sync()
+    else:
+        bbs.writeln(f"Login failed: {response}")
+        return None
+    return client
+
+async def restore_login(client, token_data):
+    client.restore_login(token_data['user_id'], token_data['device_id'], token_data['access_token'])
+    await client.sync(full_state=True)
+    return client
 
 async def join_room(client, room_id):
     await client.join(room_id)
     bbs.writeln(f"Joined room {room_id}")
     await trust_all_devices_in_room(client, room_id)
 
-async def sync_client(client):
-    # This function will keep the client synced in the background
-    while True:
-        await client.sync(timeout=10000)  # Sync every 10 seconds
-        await asyncio.sleep(1)  # Small sleep to prevent blocking
 
 async def trust_all_devices_in_room(client: AsyncClient, room_id: str):
     room = client.rooms[room_id]
     for user_id in room.users:
         for device_id, device in client.device_store[user_id].items():
+            # Automatically trust the device
+            client.verify_device(device)
+            bbs.writeln(f"Trusted device {device_id} for user {user_id}")
+
+# async def trust_all_devices_in_room(client: AsyncClient, room_id: str):
+#     room = client.rooms[room_id]
+#     for user_id in room.users:
+#         for device_id, device in client.device_store[user_id].items():
             
 
-            transaction_id = f"{client.user_id}-{device_id}-{room_id}"
-            verification_request = KeyVerificationStart(
-                from_device=client.device_id,
-                method="m.sas.v1",
-                to_device_id=device_id,
-                transaction_id=transaction_id
-            )
-            message = ToDeviceMessage("m.key.verification.start", verification_request)
-            await client.to_device(message)
-            bbs.writeln(f"Sent verification request to {user_id}, device {device_id}")
+#             transaction_id = f"{client.user_id}-{device_id}-{room_id}"
+#             verification_request = KeyVerificationStart(
+#                 from_device=client.device_id,
+#                 method="m.sas.v1",
+#                 to_device_id=device_id,
+#                 transaction_id=transaction_id
+#             )
+#             message = ToDeviceMessage("m.key.verification.start", verification_request)
+#             await client.to_device(message)
+#             bbs.writeln(f"Sent verification request to {user_id}, device {device_id}")
 
-            # client.verify_device(device)
-            # bbs.writeln(f"Trusted device {device_id} for user {user_id}")
+#             # client.verify_device(device)
+#             # bbs.writeln(f"Trusted device {device_id} for user {user_id}")
 
 def trust_devices(client: AsyncClient, user_id: str, device_list: Optional[list] = None) -> None:
     bbs.writeln(f"{user_id}'s device store: {client.device_store[user_id]}")
@@ -97,6 +113,119 @@ def trust_devices(client: AsyncClient, user_id: str, device_list: Optional[list]
         client.verify_device(olm_device)
         bbs.writeln(f"Trusting {device_id} from user {user_id}")
 
+async def main():
+    current_room_id = None
+    # Initialize MysticBBS
+    bbs.writeln("|08Enter your Matrix username:|02")
+    username = bbs.getstr(1, 50, 120, "@username:matrix.org")
+    bbs.writeln("|08Enter your Matrix password:|02")
+    password = bbs.getstr(6, 50, 120, "")
+
+    client = setup_client(username)
+    token_data = await load_token()
+
+    if token_data and token_data['user_id'] == username:
+        client = await restore_login(client, token_data)
+        bbs.writeln(f"Restored login for {token_data['user_id']}")
+    else:
+        client = await login_and_sync(client, username, password)
+        if client is None:
+            return
+
+    # Setup callbacks and start syncing
+    client.add_event_callback(lambda room, event: message_callback(room, event), RoomMessageText)
+    asyncio.create_task(sync_client(client))
+        
+    # https://matrix-nio.readthedocs.io/en/latest/examples.html#:~:text=callbacks%20%3D%20Callbacks,380
+    # need to implemetn the above for proper encryption and verification with emoji n sheit
+    
+    # Sync encryption keys with the server
+    # Required for participating in encrypted rooms
+    if client.should_upload_keys:
+        await client.keys_upload()
+
+    bbs.writeln("Starting main loop...")  # Debugging print
+    while True:
+        await client.sync()  # Perform the first sync
+        bbs.writeln("|08[|11L|08]ist rooms, |08[|11J|08]oin room, |08[|11S|08]end message, |08[|11U|08]ser list, |08[|11Q|08]uit")
+        key, extended = bbs.getkey()
+
+        if key.upper() == 'L':
+            bbs.writeln("Loading room list...") 
+            for room_id, room in client.rooms.items():
+                bbs.writeln(f"{room_id}: {room.display_name or room_id}")
+
+        elif key.upper() == 'J':
+            bbs.writeln("Loading join room list...") 
+            # Creating a list of room IDs to easily access them by index
+            room_ids = list(client.rooms.keys())
+
+            bbs.writeln(f"Room length:{len(room_ids)}") 
+
+            for i, room_id in enumerate(room_ids):
+                room_name = client.rooms[room_id].display_name or room_id
+                bbs.writeln(f"{i+1}. {room_name} ({room_id})")
+
+            room_number = bbs.getstr(1, 2, 2, "Enter room number: ")
+            if room_number.isdigit():
+                room_number = int(room_number) - 1  # Adjust for 0-based indexing
+                if room_number >= 0 and room_number < len(room_ids):
+                    selected_room_id = room_ids[room_number]
+                    current_room_id = selected_room_id  # Update current room ID
+                    await client.sync()  # Sync before listing rooms
+                    await join_room(client, selected_room_id)
+        
+
+        elif key.upper() == 'S':
+            if current_room_id:
+                message = bbs.getstr(11, 60, 120, "Enter a message to send: ")
+                await client.room_send(
+                    room_id=current_room_id,
+                    message_type="m.room.message",
+                    content={"msgtype": "m.text", "body": message})
+            else:
+                message = bbs.getstr(11, 60, 120, "Enter a message to send: ")
+                await client.room_send(
+                    room_id="!vlbfknVsxSzozrjWPu:neo.morale.ch",
+                    message_type="m.room.message",
+                    content={"msgtype": "m.text", "body": message})
+
+        elif key.upper() == 'U':  # New command for showing user list
+            bbs.writeln("Loading user list...") 
+            if current_room_id:
+                room = client.rooms[current_room_id]
+                for user_id in room.users:
+                    bbs.writeln(user_id)
+            else:
+                bbs.writeln("No room selected.")
+    
+        # elif key.upper() == 'P':  # New command for viewing previous messages
+        #     if current_room_id:
+        #         messages = await client.room_messages(current_room_id, "", limit=10)
+        #         for event in messages.chunk:
+        #             if isinstance(event, RoomMessageText):
+        #                 bbs.writeln(f"{event.sender}: {event.body}")
+        #     else:
+        #         bbs.writeln("No room selected.")
+        elif key.upper() == 'Q':
+            return
+
+        # Sync with the server to receive messages.
+        # await client.sync(timeout=30000)
+        # Sleep to keep the loop running
+        await asyncio.sleep(0.1)  # Small sleep to prevent blocking
+
+if __name__ == "__main__":
+    bbs.writeln("Starting script...")  # Debugging print
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        bbs.writeln("Script interrupted by user")
+    except Exception as e:
+        bbs.writeln(f"An error occurred: {e}")
+
+
+        
 class EmojiVerificationCallbacks:
     def __init__(self, client):
         self.client = client
@@ -131,137 +260,3 @@ class EmojiVerificationCallbacks:
                 bbs.writeln("Emoji verification successful!")
             else:
                 bbs.writeln("Emoji verification failed.")
-
-async def main():
-    current_room_id = None
-
-    bbs.writeln("|08Enter your Matrix username:|02")
-    username = bbs.getstr(1,50, 120, "@username:matrix.org")
-    bbs.writeln("|08Enter your Matrix password:|02")
-    password = bbs.getstr(6,50, 120, "")
-    bbs.write("|15")
-    
-
-    client_config = AsyncClientConfig(
-        max_limit_exceeded=0,
-        max_timeouts=0,
-        encryption_enabled=True, 
-        store_sync_tokens=True
-    )
-    client = AsyncClient(address, username, store_path="/mystic/src/data/zealmatrix", config=client_config)
-    verification_callbacks = EmojiVerificationCallbacks(client)
-    client.add_to_device_callback(verification_callbacks.to_device_callback, (KeyVerificationEvent,))
-    client.add_event_callback(lambda room, event: message_callback(room, event), RoomMessageText)
-
-    # Login to the server
-    bbs.writeln("Logging in...")  # Debugging print
-
-    token_data = await load_token()
-    if token_data:
-        client = AsyncClient(address, token_data['user_id'], device_id=token_data["device_id"], store_path="/mystic/src/data/zealmatrix", config=client_config)
-        client.restore_login(token_data['user_id'], token_data['device_id'], token_data['access_token'])
-        bbs.writeln(f"Restored login for {token_data['user_id']}")
-        user_id = token_data['user_id']
-        device_id = token_data['device_id']
-    else:
-        client = AsyncClient(address, username, store_path="/mystic/src/data/zealmatrix", config=client_config)
-        response = await client.login(password, device_name="ZealBBS")
-        if isinstance(response, LoginResponse):
-            bbs.writeln(f"Logged in as {response.user_id}")
-            user_id = response.user_id
-            device_id = client.device_id
-            await save_token(response.user_id, client.device_id, response.access_token)
-        else:
-            bbs.writeln(f"Login failed: {response}")
-            return
-        
-    # https://matrix-nio.readthedocs.io/en/latest/examples.html#:~:text=callbacks%20%3D%20Callbacks,380
-    # need to implemetn the above for proper encryption and verification with emoji n sheit
-    
-    # Sync encryption keys with the server
-    # Required for participating in encrypted rooms
-    if client.should_upload_keys:
-        await client.keys_upload()
-
-    # Call trust_devices after the first sync
-    await client.sync()  # Perform the first sync
-
-    # Start syncing the client in the background
-    asyncio.create_task(sync_client(client))
-
-    trust_devices(client, user_id)
-
-    bbs.writeln("Starting main loop...")  # Debugging print
-    while True:
-        await client.sync()  # Perform the first sync
-        bbs.writeln("|08[|11L|08]ist rooms, |08[|11J|08]oin room, |08[|11S|08]end message, |08[|11Q|08]uit")
-        key, extended = bbs.getkey()
-
-        if key.upper() == 'L':
-            for room_id, room in client.rooms.items():
-                bbs.writeln(f"{room_id}: {room.display_name or room_id}")
-
-        elif key.upper() == 'J':
-            # Creating a list of room IDs to easily access them by index
-            room_ids = list(client.rooms.keys())
-
-            for i, room_id in enumerate(room_ids):
-                room_name = client.rooms[room_id].display_name or room_id
-                bbs.writeln(f"{i+1}. {room_name} ({room_id})")
-
-            room_number = bbs.getstr(1, 2, 2, "Enter room number: ")
-            if room_number.isdigit():
-                room_number = int(room_number) - 1  # Adjust for 0-based indexing
-                if room_number >= 0 and room_number < len(room_ids):
-                    selected_room_id = room_ids[room_number]
-                    current_room_id = selected_room_id  # Update current room ID
-                    await client.sync()  # Sync before listing rooms
-                    await join_room(client, selected_room_id)
-        
-        elif key.upper() == 'P':  # New command for viewing previous messages
-            if current_room_id:
-                messages = await client.room_messages(current_room_id, "", limit=10)
-                for event in messages.chunk:
-                    if isinstance(event, RoomMessageText):
-                        bbs.writeln(f"{event.sender}: {event.body}")
-            else:
-                bbs.writeln("No room selected.")
-
-        elif key.upper() == 'S':
-            if current_room_id:
-                message = bbs.getstr(11, 60, 120, "Enter a message to send: ")
-                await client.room_send(
-                    room_id=current_room_id,
-                    message_type="m.room.message",
-                    content={"msgtype": "m.text", "body": message})
-            else:
-                message = bbs.getstr(11, 60, 120, "Enter a message to send: ")
-                await client.room_send(
-                    room_id="!vlbfknVsxSzozrjWPu:neo.morale.ch",
-                    message_type="m.room.message",
-                    content={"msgtype": "m.text", "body": message})
-
-        elif key.upper() == 'U':  # New command for showing user list
-            if current_room_id:
-                room = client.rooms[current_room_id]
-                for user_id in room.users:
-                    bbs.writeln(user_id)
-            else:
-                bbs.writeln("No room selected.")
-    
-        elif key.upper() == 'Q':
-            return
-
-        # Sync with the server to receive messages.
-        # await client.sync(timeout=30000)
-        # Sleep to keep the loop running
-        await asyncio.sleep(0.1)  # Small sleep to prevent blocking
-
-if __name__ == "__main__":
-    bbs.writeln("Starting script...")  # Debugging print
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        bbs.writeln("Script interrupted by user")
-    except Exception as e:
-        bbs.writeln(f"An error occurred: {e}")
